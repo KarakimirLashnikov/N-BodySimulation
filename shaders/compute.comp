@@ -1,0 +1,68 @@
+#version 450
+// N-body gravitational simulation – compute shader
+// Each work item computes forces on one particle from all others.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ---------------------------------------------------------------
+// Particle – must match the C++ Particle struct (32 bytes)
+// ---------------------------------------------------------------
+struct Particle {
+    vec4 position;  // xyz = position, w = mass
+    vec4 velocity;  // xyz = velocity, w = unused
+};
+
+// ---------------------------------------------------------------
+// Uniforms (std140 compatible, 16 bytes)
+// ---------------------------------------------------------------
+layout(std140, binding = 0) uniform SimParams {
+    float deltaTime;
+    uint  particleCount;
+    float gravityConstant;
+    float softening;
+} params;
+
+// ---------------------------------------------------------------
+// Particle storage (std430)
+// ---------------------------------------------------------------
+layout(std430, binding = 1) buffer ParticleBuffer {
+    Particle particles[];
+};
+
+// ---------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.particleCount) {
+        return;
+    }
+
+    Particle p = particles[idx];
+
+    // Accumulate gravitational force from all other particles
+    vec3 force = vec3(0.0);
+    float softeningSq = params.softening * params.softening;
+
+    for (uint j = 0; j < params.particleCount; ++j) {
+        if (j == idx) {
+            continue;
+        }
+
+        Particle other = particles[j];
+        vec3 dir = other.position.xyz - p.position.xyz;
+        float distSq = dot(dir, dir) + softeningSq;
+        float invDist = inversesqrt(distSq);
+        float invDist3 = invDist * invDist * invDist;
+
+        // F = G * m1 * m2 / r^3  *  r_vector
+        force += params.gravityConstant * p.position.w * other.position.w * invDist3 * dir;
+    }
+
+    // Semi-implicit Euler integration
+    vec3 acceleration = force / p.position.w;
+    p.velocity.xyz += acceleration * params.deltaTime;
+    p.position.xyz += p.velocity.xyz * params.deltaTime;
+
+    particles[idx] = p;
+}
