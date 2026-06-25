@@ -6,8 +6,11 @@
 #include <vulkan/vulkan_raii.hpp>
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace vkrd {
@@ -97,27 +100,48 @@ private:
 
   // Command
   vk::raii::CommandPool commandPool_{nullptr};
-  std::vector<vk::raii::CommandBuffer> commandBuffers_; // per-frame
+  std::vector<vk::raii::CommandBuffer> commandBuffers_; // render, per-swapchain
 
-  // Buffers
-  vk::raii::Buffer particleBuffer_{nullptr};
-  vk::raii::DeviceMemory particleBufferMemory_{nullptr};
-  vk::raii::Buffer uniformBuffer_{nullptr};
-  vk::raii::DeviceMemory uniformBufferMemory_{nullptr};
-  SimParams *mappedUniform_{nullptr};
+  // Compute-thread command pool & buffers (independent pool for thread safety)
+  vk::raii::CommandPool computeCommandPool_{nullptr};
+  std::array<vk::raii::CommandBuffer, 2> computeCommandBuffers_{nullptr,
+                                                                  nullptr};
 
-  // Descriptor pool & sets
+  // Buffers – double-buffered for compute↔render ping-pong
+  static constexpr std::uint32_t kBufCount = 2;
+  static constexpr std::uint32_t kParticleCount = 204'800;
+
+  std::array<vk::raii::Buffer, kBufCount> particleBuffers_{nullptr, nullptr};
+  std::array<vk::raii::DeviceMemory, kBufCount> particleBufferMemories_{
+      nullptr, nullptr};
+  std::array<vk::raii::Buffer, kBufCount> uniformBuffers_{nullptr, nullptr};
+  std::array<vk::raii::DeviceMemory, kBufCount> uniformBufferMemories_{
+      nullptr, nullptr};
+  std::array<SimParams *, kBufCount> mappedUniforms_{nullptr, nullptr};
+
+  // Descriptor pool & sets (one per buffer slot)
   vk::raii::DescriptorPool descriptorPool_{nullptr};
-  std::vector<vk::raii::DescriptorSet> descriptorSets_;
+  std::array<vk::raii::DescriptorSet, kBufCount> descriptorSets_{nullptr,
+                                                                   nullptr};
 
-  // Synchronisation (per swapchain image)
+  // Synchronisation (render thread – per swapchain image)
   std::vector<vk::raii::Fence> inFlightFences_;
   std::vector<vk::raii::Semaphore> imageAvailableSemaphores_;
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
 
-  // Constants
-  static constexpr std::uint32_t kParticleCount = 204800;
-  static constexpr std::uint32_t kMaxFramesInFlight = 1;
+  // Compute-thread synchronisation
+  std::array<vk::raii::Fence, kBufCount> computeFences_{nullptr, nullptr};
+
+  // Thread coordination
+  std::mutex sharedMtx_;
+  std::condition_variable sharedCv_;
+  std::mutex queueMtx_;  // protects graphicsQueue_ submissions across threads
+  int readyBuf_{-1};     // buffer ready for render (set by compute)
+  int renderingBuf_{-1}; // buffer currently being rendered (set by render)
+  bool stopCompute_{false};
+  std::thread computeThread_;
+
+  // Frame state
   std::uint32_t currentFrame_{0};
   std::uint32_t currentImageIndex_{0};
 
@@ -132,17 +156,23 @@ private:
   void createComputePipeline();
   void createGraphicsPipeline();
   void createCommandPool();
-  void createParticleBuffer();
-  void createUniformBuffer();
+  void createComputeCommandPool();
+  void createParticleBuffers();
+  void createUniformBuffers();
   void createDescriptorPoolAndSets();
   void createCommandBuffers();
+  void createComputeCommandBuffers();
   void createSyncObjects();
+  void createComputeSyncObjects();
   void initParticles();
+  void startComputeThread();
 
   // --- Per-frame helpers ---------------------------------------------------
-  void updateUniformBuffer(float dt);
-  void recordComputeCommands(vk::CommandBuffer cb);
-  void recordGraphicsCommands(vk::CommandBuffer cb);
+  void stopComputeThread();
+  void computeLoop();
+  void recordCopyCommands(vk::CommandBuffer cb, int srcIdx, int dstIdx);
+  void recordComputeCommands(vk::CommandBuffer cb, int bufIdx);
+  void recordGraphicsCommands(vk::CommandBuffer cb, int bufIdx);
 
   // --- Utility -------------------------------------------------------------
   void createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
@@ -153,7 +183,6 @@ private:
                                vk::MemoryPropertyFlags properties) const;
   vk::raii::ShaderModule createShaderModule(const std::string &filepath) const;
   SwapchainDetails querySwapchainDetails() const;
-  QueueFamilyIndices findQueueFamilies() const;
   vk::SurfaceFormatKHR chooseSurfaceFormat() const;
   vk::PresentModeKHR choosePresentMode() const;
   vk::Extent2D chooseSurfaceExtent() const;

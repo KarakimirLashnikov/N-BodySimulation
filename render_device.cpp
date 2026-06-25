@@ -1,12 +1,14 @@
 #include "render_device.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <random>
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 // ---------------------------------------------------------------------------
 // Anonymous helpers
@@ -115,7 +117,7 @@ namespace vkrd {
 RenderDevice::RenderDevice(Window &window) : window_(window) {}
 
 RenderDevice::~RenderDevice() {
-  // Wait for device to finish all work before destroying resources
+  stopComputeThread();
   if (*logicalDevice_) {
     logicalDevice_.waitIdle();
   }
@@ -135,12 +137,16 @@ void RenderDevice::initialize() {
   createComputePipeline();
   createGraphicsPipeline();
   createCommandPool();
-  createParticleBuffer();
-  createUniformBuffer();
+  createComputeCommandPool();
+  createParticleBuffers();
+  createUniformBuffers();
   createDescriptorPoolAndSets();
   createCommandBuffers();
+  createComputeCommandBuffers();
   createSyncObjects();
+  createComputeSyncObjects();
   initParticles();
+  startComputeThread();
 }
 
 // ===================================================================
@@ -455,25 +461,38 @@ void RenderDevice::createCommandPool() {
        graphicsQueueFamily_});
 }
 
-// --- Buffers ---------------------------------------------------------------
-void RenderDevice::createParticleBuffer() {
-  vk::DeviceSize size = sizeof(Particle) * kParticleCount;
-  createBuffer(size,
-               vk::BufferUsageFlagBits::eStorageBuffer |
-                   vk::BufferUsageFlagBits::eVertexBuffer |
-                   vk::BufferUsageFlagBits::eTransferDst,
-               vk::MemoryPropertyFlagBits::eDeviceLocal, particleBuffer_,
-               particleBufferMemory_);
+void RenderDevice::createComputeCommandPool() {
+  // Use graphics queue family so that pipeline stages (e.g. VERTEX_INPUT)
+  // are compatible with compute command buffers when needed for barriers.
+  computeCommandPool_ = logicalDevice_.createCommandPool(
+      {vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+       graphicsQueueFamily_});
 }
 
-void RenderDevice::createUniformBuffer() {
+// --- Buffers ---------------------------------------------------------------
+void RenderDevice::createParticleBuffers() {
+  vk::DeviceSize size = sizeof(Particle) * kParticleCount;
+  for (uint32_t i = 0; i < kBufCount; ++i) {
+    createBuffer(size,
+                 vk::BufferUsageFlagBits::eStorageBuffer |
+                     vk::BufferUsageFlagBits::eVertexBuffer |
+                     vk::BufferUsageFlagBits::eTransferDst |
+                     vk::BufferUsageFlagBits::eTransferSrc,
+                 vk::MemoryPropertyFlagBits::eDeviceLocal,
+                 particleBuffers_[i], particleBufferMemories_[i]);
+  }
+}
+
+void RenderDevice::createUniformBuffers() {
   vk::DeviceSize size = sizeof(SimParams);
-  createBuffer(size, vk::BufferUsageFlagBits::eUniformBuffer,
-               vk::MemoryPropertyFlagBits::eHostVisible |
-                   vk::MemoryPropertyFlagBits::eHostCoherent,
-               uniformBuffer_, uniformBufferMemory_);
-  mappedUniform_ = static_cast<SimParams *>(
-      uniformBufferMemory_.mapMemory(0, size));
+  for (uint32_t i = 0; i < kBufCount; ++i) {
+    createBuffer(size, vk::BufferUsageFlagBits::eUniformBuffer,
+                 vk::MemoryPropertyFlagBits::eHostVisible |
+                     vk::MemoryPropertyFlagBits::eHostCoherent,
+                 uniformBuffers_[i], uniformBufferMemories_[i]);
+    mappedUniforms_[i] = static_cast<SimParams *>(
+        uniformBufferMemories_[i].mapMemory(0, size));
+  }
 }
 
 void RenderDevice::initParticles() {
@@ -518,15 +537,17 @@ void RenderDevice::initParticles() {
   std::memcpy(data, particles.data(), static_cast<std::size_t>(size));
   stagingMem.unmapMemory();
 
-  // Copy staging → device-local
+  // Copy staging → device-local (to both buffers)
   auto cmdBuf = std::move(
       logicalDevice_
           .allocateCommandBuffers(
               {*commandPool_, vk::CommandBufferLevel::ePrimary, 1})
           .front());
   cmdBuf.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-  vk::BufferCopy region(0, 0, size);
-  cmdBuf.copyBuffer(*stagingBuf, *particleBuffer_, region);
+  for (uint32_t i = 0; i < kBufCount; ++i) {
+    vk::BufferCopy region(0, 0, size);
+    cmdBuf.copyBuffer(*stagingBuf, *particleBuffers_[i], region);
+  }
   cmdBuf.end();
 
   vk::SubmitInfo submit({}, {}, *cmdBuf);
@@ -537,43 +558,53 @@ void RenderDevice::initParticles() {
 // --- Descriptor pool & sets ------------------------------------------------
 void RenderDevice::createDescriptorPoolAndSets() {
   std::vector<vk::DescriptorPoolSize> poolSizes = {
-      {vk::DescriptorType::eUniformBuffer, 1},
-      {vk::DescriptorType::eStorageBuffer, 1}};
+      {vk::DescriptorType::eUniformBuffer, kBufCount},
+      {vk::DescriptorType::eStorageBuffer, kBufCount}};
 
   descriptorPool_ = logicalDevice_.createDescriptorPool(
-      {vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 2, poolSizes});
+      {vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, kBufCount,
+       poolSizes});
 
-  descriptorSets_ = logicalDevice_.allocateDescriptorSets(
-      {*descriptorPool_, *descriptorSetLayout_});
+  std::array<vk::DescriptorSetLayout, kBufCount> layouts;
+  layouts.fill(*descriptorSetLayout_);
+  auto sets = logicalDevice_.allocateDescriptorSets(
+      {*descriptorPool_, layouts});
+  for (uint32_t i = 0; i < kBufCount; ++i)
+    descriptorSets_[i] = std::move(sets[i]);
 
-  // Write descriptors
-  vk::DescriptorBufferInfo uboInfo(*uniformBuffer_, 0, sizeof(SimParams));
-  vk::DescriptorBufferInfo ssboInfo(*particleBuffer_, 0,
-                                    sizeof(Particle) * kParticleCount);
-
-  vk::WriteDescriptorSet writes[] = {
-      {*descriptorSets_[0], 0, 0, vk::DescriptorType::eUniformBuffer, {},
-       uboInfo},
-      {*descriptorSets_[0], 1, 0, vk::DescriptorType::eStorageBuffer, {},
-       ssboInfo},
-  };
-  logicalDevice_.updateDescriptorSets(writes, nullptr);
+  // Write descriptors: each set binds its own flight buffers
+  for (uint32_t i = 0; i < kBufCount; ++i) {
+    vk::DescriptorBufferInfo uboInfo(*uniformBuffers_[i], 0,
+                                     sizeof(SimParams));
+    vk::DescriptorBufferInfo ssboInfo(*particleBuffers_[i], 0,
+                                      sizeof(Particle) * kParticleCount);
+    vk::WriteDescriptorSet writes[] = {
+        {*descriptorSets_[i], 0, 0, vk::DescriptorType::eUniformBuffer, {},
+         uboInfo},
+        {*descriptorSets_[i], 1, 0, vk::DescriptorType::eStorageBuffer, {},
+         ssboInfo},
+    };
+    logicalDevice_.updateDescriptorSets(writes, nullptr);
+  }
 }
 
-// --- Command buffers -------------------------------------------------------
+// --- Command buffers (render thread) ---------------------------------------
 void RenderDevice::createCommandBuffers() {
   commandBuffers_ = logicalDevice_.allocateCommandBuffers(
       {*commandPool_, vk::CommandBufferLevel::ePrimary,
        static_cast<std::uint32_t>(swapchainImages_.size())});
 }
 
+void RenderDevice::createComputeCommandBuffers() {
+  auto bufs = logicalDevice_.allocateCommandBuffers(
+      {*computeCommandPool_, vk::CommandBufferLevel::ePrimary, kBufCount});
+  for (uint32_t i = 0; i < kBufCount; ++i)
+    computeCommandBuffers_[i] = std::move(bufs[i]);
+}
+
 // --- Sync objects ----------------------------------------------------------
 void RenderDevice::createSyncObjects() {
   std::uint32_t count = static_cast<std::uint32_t>(swapchainImages_.size());
-  inFlightFences_.reserve(count);
-  imageAvailableSemaphores_.reserve(count);
-  renderFinishedSemaphores_.reserve(count);
-
   for (std::uint32_t i = 0; i < count; ++i) {
     inFlightFences_.push_back(
         logicalDevice_.createFence({vk::FenceCreateFlagBits::eSignaled}));
@@ -582,21 +613,216 @@ void RenderDevice::createSyncObjects() {
   }
 }
 
+void RenderDevice::createComputeSyncObjects() {
+  for (uint32_t i = 0; i < kBufCount; ++i) {
+    computeFences_[i] =
+        logicalDevice_.createFence({vk::FenceCreateFlagBits::eSignaled});
+  }
+}
+
 // ===================================================================
-// Per-frame
+// Compute thread
+// ===================================================================
+
+void RenderDevice::startComputeThread() {
+  // --- Bootstrapping: initialise buffer 0 with first compute pass ---
+  logicalDevice_.resetFences(*computeFences_[0]);
+  {
+    auto &cb = computeCommandBuffers_[0];
+    cb.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+    recordComputeCommands(*cb, 0);
+    cb.end();
+
+    vk::SubmitInfo submit({}, {}, *cb);
+    graphicsQueue_.submit(submit, *computeFences_[0]);
+  }
+  // Wait for first result, then notify render thread
+  (void)logicalDevice_.waitForFences(*computeFences_[0], VK_TRUE,
+                                     UINT64_MAX);
+  logicalDevice_.resetFences(*computeFences_[0]);
+  {
+    std::lock_guard<std::mutex> lk(sharedMtx_);
+    readyBuf_ = 0;
+  }
+  sharedCv_.notify_one();
+
+  // Launch background loop
+  computeThread_ = std::thread(&RenderDevice::computeLoop, this);
+}
+
+void RenderDevice::stopComputeThread() {
+  {
+    std::lock_guard<std::mutex> lk(sharedMtx_);
+    stopCompute_ = true;
+  }
+  sharedCv_.notify_all();
+  if (computeThread_.joinable())
+    computeThread_.join();
+}
+
+void RenderDevice::computeLoop() {
+  constexpr float dt = 0.001f;
+  int writeBuf = 0; // buffer that just received new compute results
+
+  while (true) {
+    // ---- Switch to the *other* buffer ----
+    int nextBuf = 1 - writeBuf;
+
+    // Wait until render is done with nextBuf (so we can safely overwrite it)
+    {
+      std::unique_lock<std::mutex> lk(sharedMtx_);
+      sharedCv_.wait(lk, [&] {
+        return stopCompute_ || renderingBuf_ != nextBuf;
+      });
+      if (stopCompute_)
+        break;
+    }
+
+    // ---- Copy latest particle data from writeBuf → nextBuf ----
+    {
+      auto &cb = computeCommandBuffers_[nextBuf];
+      cb.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+      recordCopyCommands(*cb, writeBuf, nextBuf);
+      cb.end();
+
+      vk::SubmitInfo submit({}, {}, *cb);
+      {
+        std::lock_guard<std::mutex> lk(queueMtx_);
+        graphicsQueue_.submit(submit);
+        graphicsQueue_.waitIdle(); // copy is trivial, quick wait
+      }
+    }
+
+    // ---- Update uniform & dispatch compute on nextBuf ----
+    {
+      auto *u = mappedUniforms_[nextBuf];
+      u->deltaTime = dt;
+      u->particleCount = kParticleCount;
+      u->gravityConstant = 1.0f;
+      u->softening = 0.5f;
+
+      logicalDevice_.resetFences(*computeFences_[nextBuf]);
+
+      auto &cb = computeCommandBuffers_[nextBuf];
+      cb.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+      recordComputeCommands(*cb, nextBuf);
+      cb.end();
+
+      vk::SubmitInfo submit({}, {}, *cb);
+      {
+        std::lock_guard<std::mutex> lk(queueMtx_);
+        graphicsQueue_.submit(submit, *computeFences_[nextBuf]);
+      }
+    }
+
+    // Wait for compute to finish
+    (void)logicalDevice_.waitForFences(*computeFences_[nextBuf], VK_TRUE,
+                                       UINT64_MAX);
+    logicalDevice_.resetFences(*computeFences_[nextBuf]);
+
+    // ---- Notify render: nextBuf is ready ----
+    {
+      std::lock_guard<std::mutex> lk(sharedMtx_);
+      readyBuf_ = nextBuf;
+    }
+    sharedCv_.notify_one();
+
+    writeBuf = nextBuf;
+  }
+}
+
+void RenderDevice::recordCopyCommands(vk::CommandBuffer cb, int srcIdx,
+                                      int dstIdx) {
+  vk::DeviceSize size = sizeof(Particle) * kParticleCount;
+
+  // Barrier: make compute writes available for transfer read
+  vk::BufferMemoryBarrier preCopy(
+      vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eTransferRead,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      *particleBuffers_[srcIdx], 0, size);
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                     vk::PipelineStageFlagBits::eTransfer, {}, {}, preCopy,
+                     {});
+
+  vk::BufferCopy region(0, 0, size);
+  cb.copyBuffer(*particleBuffers_[srcIdx], *particleBuffers_[dstIdx], region);
+
+  // Barrier: make transfer writes available for compute shader
+  vk::BufferMemoryBarrier postCopy(
+      vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eShaderRead,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      *particleBuffers_[dstIdx], 0, size);
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                     vk::PipelineStageFlagBits::eComputeShader, {}, {},
+                     postCopy, {});
+}
+
+void RenderDevice::recordComputeCommands(vk::CommandBuffer cb, int bufIdx) {
+  vk::DeviceSize size = sizeof(Particle) * kParticleCount;
+
+  // Barrier: ensure transfer (or previous graphics) is done with this buffer
+  vk::BufferMemoryBarrier preBarrier(
+      vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eVertexAttributeRead,
+      vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      *particleBuffers_[bufIdx], 0, size);
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer |
+                         vk::PipelineStageFlagBits::eVertexInput,
+                     vk::PipelineStageFlagBits::eComputeShader, {}, {},
+                     preBarrier, {});
+
+  cb.bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline_);
+  cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                        *computePipelineLayout_, 0,
+                        *descriptorSets_[bufIdx], {});
+
+  std::uint32_t groupCount = (kParticleCount + 255) / 256;
+  cb.dispatch(groupCount, 1, 1);
+
+  // Barrier: make compute writes available for transfer / vertex
+  vk::BufferMemoryBarrier postBarrier(
+      vk::AccessFlagBits::eShaderWrite,
+      vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eVertexAttributeRead,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      *particleBuffers_[bufIdx], 0, size);
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                     vk::PipelineStageFlagBits::eTransfer |
+                         vk::PipelineStageFlagBits::eVertexInput,
+                     {}, {}, postBarrier, {});
+}
+
+// ===================================================================
+// Render thread (drawFrame)
 // ===================================================================
 void RenderDevice::drawFrame() {
-  // Wait for fence of the current frame slot (limits frames in flight)
+  // ---- Grab the latest ready buffer (non-blocking) ----
+  int renderBuf;
+  {
+    std::lock_guard<std::mutex> lk(sharedMtx_);
+    if (readyBuf_ >= 0) {
+      renderingBuf_ = readyBuf_;
+      readyBuf_ = -1;
+    }
+    renderBuf = renderingBuf_;
+  }
+  if (renderBuf < 0) {
+    // First data not ready yet; skip this frame
+    ++currentFrame_;
+    return;
+  }
+
   std::uint32_t frameIdx = currentFrame_ % swapchainImages_.size();
+
+  // Wait for fence of the current frame slot
   (void)logicalDevice_.waitForFences(*inFlightFences_[frameIdx], VK_TRUE,
-                                     std::numeric_limits<std::uint64_t>::max());
+                                     UINT64_MAX);
   logicalDevice_.resetFences(*inFlightFences_[frameIdx]);
 
-  // Acquire swapchain image — imageAvailable indexed by frame slot
+  // Acquire swapchain image
   auto [result, imageIndex] = swapchain_.acquireNextImage(
-      std::numeric_limits<std::uint64_t>::max(),
-      *imageAvailableSemaphores_[frameIdx]);
+      UINT64_MAX, *imageAvailableSemaphores_[frameIdx]);
   if (result == vk::Result::eErrorOutOfDateKHR) {
+    ++currentFrame_;
     return;
   }
   if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
@@ -604,72 +830,44 @@ void RenderDevice::drawFrame() {
   }
   currentImageIndex_ = imageIndex;
 
-  // Fixed small timestep for stability
-  constexpr float dt = 0.001f;
-  updateUniformBuffer(dt);
-
-  // Record commands — use frame slot command buffer
+  // Record render commands using the chosen particle buffer
   auto &cb = commandBuffers_[frameIdx];
   cb.begin({});
-  recordComputeCommands(*cb);
-  recordGraphicsCommands(*cb);
+  recordGraphicsCommands(*cb, renderBuf);
   cb.end();
 
-  // Submit — wait on imageAvailable[frameIdx], signal renderFinished[imageIndex]
+  // Submit
   vk::PipelineStageFlags waitStage =
       vk::PipelineStageFlagBits::eColorAttachmentOutput;
   vk::SubmitInfo submit(*imageAvailableSemaphores_[frameIdx], waitStage, *cb,
                         *renderFinishedSemaphores_[imageIndex]);
-  graphicsQueue_.submit(submit, *inFlightFences_[frameIdx]);
+  {
+    std::lock_guard<std::mutex> lk(queueMtx_);
+    graphicsQueue_.submit(submit, *inFlightFences_[frameIdx]);
+  }
 
-  // Present — wait on renderFinished[imageIndex] for the acquired image
+  // Present
   vk::PresentInfoKHR present(*renderFinishedSemaphores_[imageIndex],
                              *swapchain_, imageIndex);
-  result = graphicsQueue_.presentKHR(present);
+  {
+    std::lock_guard<std::mutex> lk(queueMtx_);
+    result = graphicsQueue_.presentKHR(present);
+  }
   if (result == vk::Result::eErrorOutOfDateKHR) {
     // TODO: recreate swapchain
   }
 
+  // Mark rendering done so compute thread can reuse this buffer
+  {
+    std::lock_guard<std::mutex> lk(sharedMtx_);
+    renderingBuf_ = -1;
+  }
+  sharedCv_.notify_one();
+
   ++currentFrame_;
 }
 
-void RenderDevice::updateUniformBuffer(float dt) {
-  mappedUniform_->deltaTime = dt;
-  mappedUniform_->particleCount = kParticleCount;
-  mappedUniform_->gravityConstant = 1.0f;
-  mappedUniform_->softening = 0.5f;
-}
-
-void RenderDevice::recordComputeCommands(vk::CommandBuffer cb) {
-  // Barrier: make sure graphics is done with the buffer
-  vk::BufferMemoryBarrier preBarrier(
-      vk::AccessFlagBits::eVertexAttributeRead,
-      vk::AccessFlagBits::eShaderWrite, VK_QUEUE_FAMILY_IGNORED,
-      VK_QUEUE_FAMILY_IGNORED, *particleBuffer_, 0,
-      sizeof(Particle) * kParticleCount);
-  cb.pipelineBarrier(vk::PipelineStageFlagBits::eVertexInput,
-                     vk::PipelineStageFlagBits::eComputeShader, {}, {},
-                     preBarrier, {});
-
-  cb.bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline_);
-  cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
-                        *computePipelineLayout_, 0, *descriptorSets_[0], {});
-
-  std::uint32_t groupCount = (kParticleCount + 255) / 256;
-  cb.dispatch(groupCount, 1, 1);
-
-  // Barrier: make compute writes available to vertex shader
-  vk::BufferMemoryBarrier postBarrier(
-      vk::AccessFlagBits::eShaderWrite,
-      vk::AccessFlagBits::eVertexAttributeRead, VK_QUEUE_FAMILY_IGNORED,
-      VK_QUEUE_FAMILY_IGNORED, *particleBuffer_, 0,
-      sizeof(Particle) * kParticleCount);
-  cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-                     vk::PipelineStageFlagBits::eVertexInput, {}, {},
-                     postBarrier, {});
-}
-
-void RenderDevice::recordGraphicsCommands(vk::CommandBuffer cb) {
+void RenderDevice::recordGraphicsCommands(vk::CommandBuffer cb, int bufIdx) {
   // Compute MVP matrix – orbiting camera
   static float time = 0.0f;
   time += 0.001f;
@@ -711,7 +909,8 @@ void RenderDevice::recordGraphicsCommands(vk::CommandBuffer cb) {
 
   cb.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline_);
   cb.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
-                        *graphicsPipelineLayout_, 0, *descriptorSets_[0], {});
+                        *graphicsPipelineLayout_, 0,
+                        *descriptorSets_[bufIdx], {});
   cb.pushConstants<MVPMatrix>(*graphicsPipelineLayout_,
                               vk::ShaderStageFlagBits::eVertex, 0, mvp);
 
