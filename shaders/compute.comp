@@ -4,7 +4,11 @@
 //   Work groups cooperatively load tiles of particles into shared memory,
 //   reducing global memory reads by a factor of local_size_x (256×).
 //   The original O(N²) algorithm was entirely memory-bandwidth-bound.
-//   After tiling we become compute-bound instead, yielding ~50–60× speedup.
+//   After tiling we become compute-bound instead.
+// Loop unrolling (4-way):
+//   The inner particle-interaction loop is unrolled 4× with independent
+//   force accumulators to break the FMA dependency chain, allowing the
+//   GPU to issue 4 parallel FMA pipelines.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -54,7 +58,16 @@ void main() {
     float myMass       = p.position.w;
     float G            = params.gravityConstant;
 
-    vec3 force = vec3(0.0);
+    // 4-way independent accumulators to break FMA dependency chain.
+    // Each accumulator forms its own non-interfering instruction stream
+    // so the GPU can issue multiple FMAs in parallel.
+    vec3 force0 = vec3(0.0);
+    vec3 force1 = vec3(0.0);
+    vec3 force2 = vec3(0.0);
+    vec3 force3 = vec3(0.0);
+
+    // Pre-scale mass to avoid repeating per interaction
+    float GMi = G * myMass;
 
     // Tile count: ceil(particleCount / 256)
     uint numTiles = (params.particleCount + 255u) / 256u;
@@ -75,7 +88,60 @@ void main() {
         uint tileBase  = t * 256u;
         uint tileCount = min(256u, params.particleCount - tileBase);
 
-        for (uint j = 0u; j < tileCount; ++j) {
+        // Unrolled 4×: process 4 other particles per loop iteration.
+        // Each lane writes to a different accumulator so the compiler
+        // (and hardware) can schedule the FMAs independently.
+        uint j = 0u;
+        for (; j + 3u < tileCount; j += 4u) {
+            uint o0 = tileBase + j;
+            uint o1 = o0 + 1u;
+            uint o2 = o0 + 2u;
+            uint o3 = o0 + 3u;
+
+            // ---- Lane 0 ----
+            if (o0 != idx) {
+                Particle t0 = tile[j];
+                vec3  d0    = t0.position.xyz - p.position.xyz;
+                float rSq0  = dot(d0, d0) + softeningSq;
+                float invR0 = inversesqrt(rSq0);
+                float f0    = GMi * t0.position.w * invR0 * invR0 * invR0;
+                force0 += f0 * d0;
+            }
+
+            // ---- Lane 1 ----
+            if (o1 != idx) {
+                Particle t1 = tile[j + 1u];
+                vec3  d1    = t1.position.xyz - p.position.xyz;
+                float rSq1  = dot(d1, d1) + softeningSq;
+                float invR1 = inversesqrt(rSq1);
+                float f1    = GMi * t1.position.w * invR1 * invR1 * invR1;
+                force1 += f1 * d1;
+            }
+
+            // ---- Lane 2 ----
+            if (o2 != idx) {
+                Particle t2 = tile[j + 2u];
+                vec3  d2    = t2.position.xyz - p.position.xyz;
+                float rSq2  = dot(d2, d2) + softeningSq;
+                float invR2 = inversesqrt(rSq2);
+                float f2    = GMi * t2.position.w * invR2 * invR2 * invR2;
+                force2 += f2 * d2;
+            }
+
+            // ---- Lane 3 ----
+            if (o3 != idx) {
+                Particle t3 = tile[j + 3u];
+                vec3  d3    = t3.position.xyz - p.position.xyz;
+                float rSq3  = dot(d3, d3) + softeningSq;
+                float invR3 = inversesqrt(rSq3);
+                float f3    = GMi * t3.position.w * invR3 * invR3 * invR3;
+                force3 += f3 * d3;
+            }
+        }
+
+        // ---- Remainder (0–3 particles) ----
+        // Fold remainder into force0 to keep the merge trivial.
+        for (; j < tileCount; ++j) {
             uint otherIdx = tileBase + j;
             if (otherIdx == idx) {
                 continue;
@@ -87,14 +153,16 @@ void main() {
             float invDist   = inversesqrt(distSq);
             float invDist3  = invDist * invDist * invDist;
 
-            // F = G * m_i * m_j / r³  *  r̂
-            force += G * myMass * other.position.w * invDist3 * dir;
+            force0 += GMi * other.position.w * invDist3 * dir;
         }
 
         // Ensure all threads finish reading the tile before it gets
         // overwritten by the next cooperative load.
         barrier();
     }
+
+    // Merge the four independent accumulators
+    vec3 force = (force0 + force1) + (force2 + force3);
 
     // Semi-implicit Euler integration
     vec3 acceleration = force / myMass;
