@@ -116,7 +116,7 @@ private:
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
 
   // Constants
-  static constexpr std::uint32_t kParticleCount = 2048;
+  static constexpr std::uint32_t kParticleCount = 204800;
   static constexpr std::uint32_t kMaxFramesInFlight = 1;
   std::uint32_t currentFrame_{0};
   std::uint32_t currentImageIndex_{0};
