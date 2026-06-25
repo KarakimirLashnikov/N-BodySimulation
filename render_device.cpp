@@ -628,6 +628,13 @@ void RenderDevice::createComputeSyncObjects() {
 
 void RenderDevice::startComputeThread() {
   // --- Bootstrapping: initialise buffer 0 with first compute pass ---
+  // Write initial simulation parameters so compute shader has valid data
+  auto *u = mappedUniforms_[0];
+  u->deltaTime = 0.001f;
+  u->particleCount = kParticleCount;
+  u->gravityConstant = 1.0f;
+  u->softening = 0.5f;
+
   logicalDevice_.resetFences(*computeFences_[0]);
   {
     auto &cb = computeCommandBuffers_[0];
@@ -768,16 +775,22 @@ void RenderDevice::recordCopyCommands(vk::CommandBuffer cb, int srcIdx,
 void RenderDevice::recordComputeCommands(vk::CommandBuffer cb, int bufIdx) {
   vk::DeviceSize size = sizeof(Particle) * kParticleCount;
 
-  // Barrier: ensure copy (transfer) is done before compute reads this buffer.
+  // Barrier: make host writes to uniform buffer available for compute,
+  // and ensure copy (transfer) is done before compute reads the SSBO.
   // No need to wait for VERTEX_INPUT — compute & render use different buffers.
-  vk::BufferMemoryBarrier preBarrier(
+  vk::BufferMemoryBarrier uboBarrier(
+      vk::AccessFlagBits::eHostWrite, vk::AccessFlagBits::eUniformRead,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      *uniformBuffers_[bufIdx], 0, sizeof(SimParams));
+  vk::BufferMemoryBarrier ssboBarrier(
       vk::AccessFlagBits::eTransferWrite,
       vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
       *particleBuffers_[bufIdx], 0, size);
-  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                     vk::PipelineStageFlagBits::eComputeShader, {}, {},
-                     preBarrier, {});
+  std::array<vk::BufferMemoryBarrier, 2> preBarriers{uboBarrier, ssboBarrier};
+  cb.pipelineBarrier(
+      vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer,
+      vk::PipelineStageFlagBits::eComputeShader, {}, {}, preBarriers, {});
 
   cb.bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline_);
   cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
