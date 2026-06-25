@@ -615,6 +615,8 @@ void RenderDevice::createSyncObjects() {
 
 void RenderDevice::createComputeSyncObjects() {
   for (uint32_t i = 0; i < kBufCount; ++i) {
+    copyFences_[i] =
+        logicalDevice_.createFence({vk::FenceCreateFlagBits::eSignaled});
     computeFences_[i] =
         logicalDevice_.createFence({vk::FenceCreateFlagBits::eSignaled});
   }
@@ -680,6 +682,8 @@ void RenderDevice::computeLoop() {
 
     // ---- Copy latest particle data from writeBuf → nextBuf ----
     {
+      logicalDevice_.resetFences(*copyFences_[nextBuf]);
+
       auto &cb = computeCommandBuffers_[nextBuf];
       cb.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
       recordCopyCommands(*cb, writeBuf, nextBuf);
@@ -688,13 +692,17 @@ void RenderDevice::computeLoop() {
       vk::SubmitInfo submit({}, {}, *cb);
       {
         std::lock_guard<std::mutex> lk(queueMtx_);
-        graphicsQueue_.submit(submit);
-        graphicsQueue_.waitIdle(); // copy is trivial, quick wait
+        graphicsQueue_.submit(submit, *copyFences_[nextBuf]);
       }
     }
 
     // ---- Update uniform & dispatch compute on nextBuf ----
     {
+      // Wait for the copy to finish before dispatching compute
+      (void)logicalDevice_.waitForFences(*copyFences_[nextBuf], VK_TRUE,
+                                         UINT64_MAX);
+      logicalDevice_.resetFences(*copyFences_[nextBuf]);
+
       auto *u = mappedUniforms_[nextBuf];
       u->deltaTime = dt;
       u->particleCount = kParticleCount;
@@ -760,14 +768,14 @@ void RenderDevice::recordCopyCommands(vk::CommandBuffer cb, int srcIdx,
 void RenderDevice::recordComputeCommands(vk::CommandBuffer cb, int bufIdx) {
   vk::DeviceSize size = sizeof(Particle) * kParticleCount;
 
-  // Barrier: ensure transfer (or previous graphics) is done with this buffer
+  // Barrier: ensure copy (transfer) is done before compute reads this buffer.
+  // No need to wait for VERTEX_INPUT — compute & render use different buffers.
   vk::BufferMemoryBarrier preBarrier(
-      vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eVertexAttributeRead,
+      vk::AccessFlagBits::eTransferWrite,
       vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
       *particleBuffers_[bufIdx], 0, size);
-  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer |
-                         vk::PipelineStageFlagBits::eVertexInput,
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                      vk::PipelineStageFlagBits::eComputeShader, {}, {},
                      preBarrier, {});
 
@@ -797,11 +805,13 @@ void RenderDevice::recordComputeCommands(vk::CommandBuffer cb, int bufIdx) {
 void RenderDevice::drawFrame() {
   // ---- Grab the latest ready buffer (non-blocking) ----
   int renderBuf;
+  bool gotNewData = false;
   {
     std::lock_guard<std::mutex> lk(sharedMtx_);
     if (readyBuf_ >= 0) {
       renderingBuf_ = readyBuf_;
       readyBuf_ = -1;
+      gotNewData = true;
     }
     renderBuf = renderingBuf_;
   }
@@ -857,8 +867,9 @@ void RenderDevice::drawFrame() {
     // TODO: recreate swapchain
   }
 
-  // Mark rendering done so compute thread can reuse this buffer
-  {
+  // Mark rendering done — only release buffer if new data was consumed,
+  // otherwise keep displaying it (compute checks renderingBuf_ before overwrite)
+  if (gotNewData) {
     std::lock_guard<std::mutex> lk(sharedMtx_);
     renderingBuf_ = -1;
   }

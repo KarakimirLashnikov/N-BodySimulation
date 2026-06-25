@@ -130,6 +130,7 @@ private:
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores_;
 
   // Compute-thread synchronisation
+  std::array<vk::raii::Fence, kBufCount> copyFences_{nullptr, nullptr};
   std::array<vk::raii::Fence, kBufCount> computeFences_{nullptr, nullptr};
 
   // Thread coordination
