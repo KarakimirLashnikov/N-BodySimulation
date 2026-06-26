@@ -138,11 +138,13 @@ void RenderDevice::initialize() {
   createGraphicsPipeline();
   createCommandPool();
   createComputeCommandPool();
+  createTransferCommandPool();
   createParticleBuffers();
   createUniformBuffers();
   createDescriptorPoolAndSets();
   createCommandBuffers();
   createComputeCommandBuffers();
+  createTransferCommandBuffers();
   createSyncObjects();
   createComputeSyncObjects();
   initParticles();
@@ -230,10 +232,24 @@ void RenderDevice::pickPhysicalDevice() {
       if (qFamilies[i].queueFlags & vk::QueueFlagBits::eCompute) {
         indices.compute = i;
       }
+      // We intentionally avoid dedicated transfer-only families.
+      // Barriers that involve shader access flags (SHADER_WRITE / SHADER_READ)
+      // need a pipeline stage that supports those flags, and pure transfer
+      // queues only expose COPY/BLIT/CLEAR — no shader stages.  Picking a
+      // compute-capable family keeps barrier stage/access masks valid.
+      // Falls back to any transfer-capable family, and finally to graphics.
+      bool hasTransfer = static_cast<bool>(
+          qFamilies[i].queueFlags & vk::QueueFlagBits::eTransfer);
+      if (hasTransfer && !indices.transfer.has_value()) {
+        indices.transfer = i;
+      }
       if (dev.getSurfaceSupportKHR(i, *surface_)) {
         indices.present = i;
       }
       if (indices.isComplete()) break;
+    }
+    if (!indices.transfer.has_value()) {
+      indices.transfer = indices.graphics; // final fallback
     }
     if (!indices.isComplete()) continue;
 
@@ -278,9 +294,17 @@ void RenderDevice::createLogicalDevice() {
     if (qFamilies[i].queueFlags & vk::QueueFlagBits::eCompute) {
       indices.compute = i;
     }
+    bool hasTransfer = static_cast<bool>(
+        qFamilies[i].queueFlags & vk::QueueFlagBits::eTransfer);
+    if (hasTransfer && !indices.transfer.has_value()) {
+      indices.transfer = i;
+    }
     if (physicalDevice_.getSurfaceSupportKHR(i, *surface_)) {
       indices.present = i;
     }
+  }
+  if (!indices.transfer.has_value()) {
+    indices.transfer = indices.graphics;
   }
   if (!indices.isComplete()) {
     throw std::runtime_error("Queue family indices incomplete");
@@ -288,10 +312,16 @@ void RenderDevice::createLogicalDevice() {
 
   graphicsQueueFamily_ = *indices.graphics;
   computeQueueFamily_ = *indices.compute;
+  transferQueueFamily_ = *indices.transfer;
+
+  needCrossQueueSync_ = (graphicsQueueFamily_ != computeQueueFamily_) ||
+                        (graphicsQueueFamily_ != transferQueueFamily_) ||
+                        (computeQueueFamily_ != transferQueueFamily_);
 
   float queuePriority = 1.0f;
   std::set<std::uint32_t> uniqueFamilies = {graphicsQueueFamily_,
-                                            computeQueueFamily_};
+                                            computeQueueFamily_,
+                                            transferQueueFamily_};
   std::vector<vk::DeviceQueueCreateInfo> queueInfos;
   for (auto fam : uniqueFamilies) {
     queueInfos.push_back(
@@ -310,6 +340,7 @@ void RenderDevice::createLogicalDevice() {
 
   graphicsQueue_ = logicalDevice_.getQueue(graphicsQueueFamily_, 0);
   computeQueue_ = logicalDevice_.getQueue(computeQueueFamily_, 0);
+  transferQueue_ = logicalDevice_.getQueue(transferQueueFamily_, 0);
 }
 
 // --- Swapchain -------------------------------------------------------------
@@ -462,24 +493,55 @@ void RenderDevice::createCommandPool() {
 }
 
 void RenderDevice::createComputeCommandPool() {
-  // Use graphics queue family so that pipeline stages (e.g. VERTEX_INPUT)
-  // are compatible with compute command buffers when needed for barriers.
+  // Use compute queue family — VERTEX_INPUT barriers are now handled
+  // by the graphics command buffer (recordGraphicsCommands) instead.
   computeCommandPool_ = logicalDevice_.createCommandPool(
       {vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-       graphicsQueueFamily_});
+       computeQueueFamily_});
+}
+
+void RenderDevice::createTransferCommandPool() {
+  transferCommandPool_ = logicalDevice_.createCommandPool(
+      {vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+       transferQueueFamily_});
 }
 
 // --- Buffers ---------------------------------------------------------------
 void RenderDevice::createParticleBuffers() {
   vk::DeviceSize size = sizeof(Particle) * kParticleCount;
+  vk::BufferUsageFlags usage =
+      vk::BufferUsageFlagBits::eStorageBuffer |
+      vk::BufferUsageFlagBits::eVertexBuffer |
+      vk::BufferUsageFlagBits::eTransferDst |
+      vk::BufferUsageFlagBits::eTransferSrc;
+
+  // When queue families differ, use CONCURRENT sharing so barriers can stay
+  // VK_QUEUE_FAMILY_IGNORED without requiring QFO ownership transfers.
+  // Collect unique family indices first — transfer and compute families may
+  // now be the same since we avoid dedicated transfer queues.
+  std::set<std::uint32_t> uniqueFams = {graphicsQueueFamily_,
+                                         computeQueueFamily_,
+                                         transferQueueFamily_};
+  std::vector<std::uint32_t> sharingFamilies(uniqueFams.begin(),
+                                             uniqueFams.end());
+  vk::BufferCreateInfo bufferInfo{
+      {}, size, usage,
+      needCrossQueueSync_ ? vk::SharingMode::eConcurrent
+                          : vk::SharingMode::eExclusive,
+      needCrossQueueSync_
+          ? static_cast<std::uint32_t>(sharingFamilies.size())
+          : 0u,
+      needCrossQueueSync_ ? sharingFamilies.data() : nullptr};
+
   for (uint32_t i = 0; i < kBufCount; ++i) {
-    createBuffer(size,
-                 vk::BufferUsageFlagBits::eStorageBuffer |
-                     vk::BufferUsageFlagBits::eVertexBuffer |
-                     vk::BufferUsageFlagBits::eTransferDst |
-                     vk::BufferUsageFlagBits::eTransferSrc,
-                 vk::MemoryPropertyFlagBits::eDeviceLocal,
-                 particleBuffers_[i], particleBufferMemories_[i]);
+    particleBuffers_[i] = logicalDevice_.createBuffer(bufferInfo);
+    auto memReqs = particleBuffers_[i].getMemoryRequirements();
+    std::uint32_t memType =
+        findMemoryType(memReqs.memoryTypeBits,
+                       vk::MemoryPropertyFlagBits::eDeviceLocal);
+    particleBufferMemories_[i] =
+        logicalDevice_.allocateMemory({memReqs.size, memType});
+    particleBuffers_[i].bindMemory(*particleBufferMemories_[i], 0);
   }
 }
 
@@ -602,6 +664,13 @@ void RenderDevice::createComputeCommandBuffers() {
     computeCommandBuffers_[i] = std::move(bufs[i]);
 }
 
+void RenderDevice::createTransferCommandBuffers() {
+  auto bufs = logicalDevice_.allocateCommandBuffers(
+      {*transferCommandPool_, vk::CommandBufferLevel::ePrimary, kBufCount});
+  for (uint32_t i = 0; i < kBufCount; ++i)
+    transferCommandBuffers_[i] = std::move(bufs[i]);
+}
+
 // --- Sync objects ----------------------------------------------------------
 void RenderDevice::createSyncObjects() {
   std::uint32_t count = static_cast<std::uint32_t>(swapchainImages_.size());
@@ -618,6 +687,9 @@ void RenderDevice::createComputeSyncObjects() {
     copyFences_[i] =
         logicalDevice_.createFence({vk::FenceCreateFlagBits::eSignaled});
     computeFences_[i] =
+        logicalDevice_.createFence({vk::FenceCreateFlagBits::eSignaled});
+    // Signalled initially so compute thread won't block on the first iteration
+    renderDoneFences_[i] =
         logicalDevice_.createFence({vk::FenceCreateFlagBits::eSignaled});
   }
 }
@@ -643,7 +715,7 @@ void RenderDevice::startComputeThread() {
     cb.end();
 
     vk::SubmitInfo submit({}, {}, *cb);
-    graphicsQueue_.submit(submit, *computeFences_[0]);
+    computeQueue_.submit(submit, *computeFences_[0]);
   }
   // Wait for first result, then notify render thread
   (void)logicalDevice_.waitForFences(*computeFences_[0], VK_TRUE,
@@ -689,9 +761,17 @@ void RenderDevice::computeLoop() {
 
     // ---- Copy latest particle data from writeBuf → nextBuf ----
     {
+      // When queue families differ, wait for the GPU to finish rendering
+      // nextBuf before we write to it (cross-queue write-after-read hazard).
+      if (needCrossQueueSync_) {
+        (void)logicalDevice_.waitForFences(*renderDoneFences_[nextBuf],
+                                           VK_TRUE, UINT64_MAX);
+        logicalDevice_.resetFences(*renderDoneFences_[nextBuf]);
+      }
+
       logicalDevice_.resetFences(*copyFences_[nextBuf]);
 
-      auto &cb = computeCommandBuffers_[nextBuf];
+      auto &cb = transferCommandBuffers_[nextBuf];
       cb.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
       recordCopyCommands(*cb, writeBuf, nextBuf);
       cb.end();
@@ -699,7 +779,7 @@ void RenderDevice::computeLoop() {
       vk::SubmitInfo submit({}, {}, *cb);
       {
         std::lock_guard<std::mutex> lk(queueMtx_);
-        graphicsQueue_.submit(submit, *copyFences_[nextBuf]);
+        transferQueue_.submit(submit, *copyFences_[nextBuf]);
       }
     }
 
@@ -726,7 +806,7 @@ void RenderDevice::computeLoop() {
       vk::SubmitInfo submit({}, {}, *cb);
       {
         std::lock_guard<std::mutex> lk(queueMtx_);
-        graphicsQueue_.submit(submit, *computeFences_[nextBuf]);
+        computeQueue_.submit(submit, *computeFences_[nextBuf]);
       }
     }
 
@@ -750,6 +830,9 @@ void RenderDevice::recordCopyCommands(vk::CommandBuffer cb, int srcIdx,
                                       int dstIdx) {
   vk::DeviceSize size = sizeof(Particle) * kParticleCount;
 
+  // The transfer queue is always compute-capable (we avoid dedicated
+  // transfer-only families), so COMPUTE_SHADER is a valid stage here.
+
   // Barrier: make compute writes available for transfer read
   vk::BufferMemoryBarrier preCopy(
       vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eTransferRead,
@@ -768,8 +851,8 @@ void RenderDevice::recordCopyCommands(vk::CommandBuffer cb, int srcIdx,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
       *particleBuffers_[dstIdx], 0, size);
   cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                     vk::PipelineStageFlagBits::eComputeShader, {}, {},
-                     postCopy, {});
+                     vk::PipelineStageFlagBits::eComputeShader,
+                     {}, {}, postCopy, {});
 }
 
 void RenderDevice::recordComputeCommands(vk::CommandBuffer cb, int bufIdx) {
@@ -800,16 +883,23 @@ void RenderDevice::recordComputeCommands(vk::CommandBuffer cb, int bufIdx) {
   std::uint32_t groupCount = (kParticleCount + 255) / 256;
   cb.dispatch(groupCount, 1, 1);
 
-  // Barrier: make compute writes available for transfer / vertex
+  // Barrier: make compute writes available for transfer (copy source) and
+  // vertex input (graphics rendering). When compute and graphics are different
+  // queue families, VERTEX_INPUT is not a valid stage on the compute queue;
+  // the graphics command buffer handles its own acquire barrier instead.
+  vk::AccessFlags dstAccess = vk::AccessFlagBits::eTransferRead;
+  vk::PipelineStageFlags dstStage = vk::PipelineStageFlagBits::eTransfer;
+  if (computeQueueFamily_ == graphicsQueueFamily_) {
+    // Same family — VERTEX_INPUT is valid here, release to both consumers
+    dstAccess |= vk::AccessFlagBits::eVertexAttributeRead;
+    dstStage |= vk::PipelineStageFlagBits::eVertexInput;
+  }
   vk::BufferMemoryBarrier postBarrier(
-      vk::AccessFlagBits::eShaderWrite,
-      vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eVertexAttributeRead,
+      vk::AccessFlagBits::eShaderWrite, dstAccess,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
       *particleBuffers_[bufIdx], 0, size);
   cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-                     vk::PipelineStageFlagBits::eTransfer |
-                         vk::PipelineStageFlagBits::eVertexInput,
-                     {}, {}, postBarrier, {});
+                     dstStage, {}, {}, postBarrier, {});
 }
 
 // ===================================================================
@@ -869,6 +959,23 @@ void RenderDevice::drawFrame() {
     graphicsQueue_.submit(submit, *inFlightFences_[frameIdx]);
   }
 
+  // Signal per-buffer fence for cross-queue synchronisation.
+  // This tells the compute thread that the GPU is truly done reading
+  // renderBuf, so it's safe to overwrite that buffer from another queue.
+  // We submit an empty batch on the same graphics queue — FIFO ordering
+  // guarantees it executes after the render submit above, so the fence
+  // signals when the render is truly complete.
+  if (needCrossQueueSync_) {
+    // The fence may still be SIGNALED from creation (very first frame)
+    // or from a previous cycle; reset it before submission.
+    logicalDevice_.resetFences(*renderDoneFences_[renderBuf]);
+    vk::SubmitInfo fenceSubmit({}, {}, {}, {});
+    {
+      std::lock_guard<std::mutex> lk(queueMtx_);
+      graphicsQueue_.submit(fenceSubmit, *renderDoneFences_[renderBuf]);
+    }
+  }
+
   // Present
   vk::PresentInfoKHR present(*renderFinishedSemaphores_[imageIndex],
                              *swapchain_, imageIndex);
@@ -906,6 +1013,24 @@ void RenderDevice::recordGraphicsCommands(vk::CommandBuffer cb, int bufIdx) {
 
   MVPMatrix mvp;
   mvp.mvp = mul(proj, view);
+
+  // Acquire particle buffer: make compute writes visible for vertex reading.
+  // Only needed when compute is a different queue family (on a single-family
+  // GPU the compute post-barrier already covers VERTEX_INPUT).
+  vk::DeviceSize particleSize = sizeof(Particle) * kParticleCount;
+  if (computeQueueFamily_ != graphicsQueueFamily_) {
+    vk::BufferMemoryBarrier acquireSSBO(
+        vk::AccessFlagBits::eShaderWrite,
+        vk::AccessFlagBits::eVertexAttributeRead,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        *particleBuffers_[bufIdx], 0, particleSize);
+    // ALL_COMMANDS_BIT supports every access flag (including SHADER_WRITE)
+    // and is valid on graphics queues.  This makes external compute-queue
+    // writes visible for vertex input in the consuming graphics queue.
+    cb.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                       vk::PipelineStageFlagBits::eVertexInput, {}, {},
+                       acquireSSBO, {});
+  }
 
   // Transition swapchain image to colour attachment layout
   vk::ImageMemoryBarrier toColor(
@@ -946,6 +1071,17 @@ void RenderDevice::recordGraphicsCommands(vk::CommandBuffer cb, int bufIdx) {
 
   cb.draw(kParticleCount, 1, 0, 0);
   cb.endRendering();
+
+  // Release particle buffer: make vertex reads available for transfer
+  // (the next copy will read from this buffer as source).
+  vk::BufferMemoryBarrier releaseSSBO(
+      vk::AccessFlagBits::eVertexAttributeRead,
+      vk::AccessFlagBits::eTransferRead,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+      *particleBuffers_[bufIdx], 0, particleSize);
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eVertexInput,
+                     vk::PipelineStageFlagBits::eTransfer, {}, {},
+                     releaseSSBO, {});
 
   // Transition to present layout
   vk::ImageMemoryBarrier toPresent(

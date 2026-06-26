@@ -61,10 +61,12 @@ private:
   struct QueueFamilyIndices {
     std::optional<std::uint32_t> graphics{};
     std::optional<std::uint32_t> compute{};
+    std::optional<std::uint32_t> transfer{};
     std::optional<std::uint32_t> present{};
 
     bool isComplete() const {
-      return graphics.has_value() && compute.has_value() && present.has_value();
+      return graphics.has_value() && compute.has_value() && transfer.has_value() &&
+             present.has_value();
     }
   };
 
@@ -79,8 +81,11 @@ private:
   // Queues
   vk::raii::Queue graphicsQueue_{nullptr}; // graphics + present
   vk::raii::Queue computeQueue_{nullptr};  // compute (may be same family)
+  vk::raii::Queue transferQueue_{nullptr}; // transfer (may be same family)
   std::uint32_t graphicsQueueFamily_{};
   std::uint32_t computeQueueFamily_{};
+  std::uint32_t transferQueueFamily_{};
+  bool needCrossQueueSync_{false}; // true when any queue families differ
 
   // Swapchain
   vk::raii::SwapchainKHR swapchain_{nullptr};
@@ -106,6 +111,11 @@ private:
   vk::raii::CommandPool computeCommandPool_{nullptr};
   std::array<vk::raii::CommandBuffer, 2> computeCommandBuffers_{nullptr,
                                                                   nullptr};
+
+  // Transfer command pool & buffers (for cross-queue copy operations)
+  vk::raii::CommandPool transferCommandPool_{nullptr};
+  std::array<vk::raii::CommandBuffer, 2> transferCommandBuffers_{nullptr,
+                                                                   nullptr};
 
   // Buffers – double-buffered for compute↔render ping-pong
   static constexpr std::uint32_t kBufCount = 2;
@@ -133,10 +143,14 @@ private:
   std::array<vk::raii::Fence, kBufCount> copyFences_{nullptr, nullptr};
   std::array<vk::raii::Fence, kBufCount> computeFences_{nullptr, nullptr};
 
+  // Per-buffer fences: signalled when GPU finishes rendering a buffer
+  // (cross-queue sync: prevents compute from overwriting while GPU reads)
+  std::array<vk::raii::Fence, kBufCount> renderDoneFences_{nullptr, nullptr};
+
   // Thread coordination
   std::mutex sharedMtx_;
   std::condition_variable sharedCv_;
-  std::mutex queueMtx_;  // protects graphicsQueue_ submissions across threads
+  std::mutex queueMtx_;  // protects all queue submissions across threads
   int readyBuf_{-1};     // buffer ready for render (set by compute)
   int renderingBuf_{-1}; // buffer currently being rendered (set by render)
   bool stopCompute_{false};
@@ -158,11 +172,13 @@ private:
   void createGraphicsPipeline();
   void createCommandPool();
   void createComputeCommandPool();
+  void createTransferCommandPool();
   void createParticleBuffers();
   void createUniformBuffers();
   void createDescriptorPoolAndSets();
   void createCommandBuffers();
   void createComputeCommandBuffers();
+  void createTransferCommandBuffers();
   void createSyncObjects();
   void createComputeSyncObjects();
   void initParticles();
