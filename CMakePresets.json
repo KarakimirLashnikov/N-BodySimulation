@@ -13,10 +13,6 @@
                 "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install",
                 "CMAKE_C_COMPILER": "cl.exe",
                 "CMAKE_CXX_COMPILER": "cl.exe"
-            },
-            "environment": {
-                "CFLAGS": "/fsanitize=address",
-                "CXXFLAGS": "/fsanitize=address /fsanitize=thread"
             }
         }
     ]

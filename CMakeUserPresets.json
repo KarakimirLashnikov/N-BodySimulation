@@ -7,6 +7,10 @@
             "toolchainFile": "D:/MyTools/Vcpkg/vcpkg/scripts/buildsystems/vcpkg.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE":"Debug"
+            },
+            "environment": {
+                "CFLAGS": "/fsanitize=address",
+                "CXXFLAGS": "/fsanitize=address /fsanitize=thread"
             }
         },
         {
