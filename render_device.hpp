@@ -119,7 +119,7 @@ private:
 
   // Buffers – double-buffered for compute↔render ping-pong
   static constexpr std::uint32_t kBufCount = 2;
-  static constexpr std::uint32_t kParticleCount = 204'800;
+  static constexpr std::uint32_t kParticleCount = 100'000;
 
   std::array<vk::raii::Buffer, kBufCount> particleBuffers_{nullptr, nullptr};
   std::array<vk::raii::DeviceMemory, kBufCount> particleBufferMemories_{
@@ -150,7 +150,6 @@ private:
   // Thread coordination
   std::mutex sharedMtx_;
   std::condition_variable sharedCv_;
-  std::mutex queueMtx_;  // protects all queue submissions across threads
   int readyBuf_{-1};     // buffer ready for render (set by compute)
   int renderingBuf_{-1}; // buffer currently being rendered (set by render)
   bool stopCompute_{false};

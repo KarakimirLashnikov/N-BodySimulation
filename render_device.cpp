@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -318,14 +319,30 @@ void RenderDevice::createLogicalDevice() {
                         (graphicsQueueFamily_ != transferQueueFamily_) ||
                         (computeQueueFamily_ != transferQueueFamily_);
 
-  float queuePriority = 1.0f;
-  std::set<std::uint32_t> uniqueFamilies = {graphicsQueueFamily_,
-                                            computeQueueFamily_,
-                                            transferQueueFamily_};
+  // Count how many queues each family needs.
+  // Graphics / compute / transfer may land on the same physical family
+  // (common on single-family GPUs).  We request a distinct VkQueue for
+  // each usage so they can be submitted from different threads without
+  // external synchronisation.
+  std::map<std::uint32_t, std::uint32_t> familyCount;
+  familyCount[graphicsQueueFamily_]++;
+  familyCount[computeQueueFamily_]++;
+  familyCount[transferQueueFamily_]++;
+
   std::vector<vk::DeviceQueueCreateInfo> queueInfos;
-  for (auto fam : uniqueFamilies) {
+  // per-family priority arrays — must outlive vkCreateDevice
+  std::vector<std::vector<float>> perFamilyPriorities;
+  for (auto [fam, count] : familyCount) {
+    std::uint32_t available = qFamilies[fam].queueCount;
+    if (count > available) {
+      throw std::runtime_error(
+          "Queue family " + std::to_string(fam) + " has only " +
+          std::to_string(available) + " queue(s); need " +
+          std::to_string(count));
+    }
+    perFamilyPriorities.push_back(std::vector<float>(count, 1.0f));
     queueInfos.push_back(
-        {{}, fam, 1, &queuePriority});
+        {{}, fam, count, perFamilyPriorities.back().data()});
   }
 
   vk::PhysicalDeviceFeatures deviceFeatures{};
@@ -338,9 +355,16 @@ void RenderDevice::createLogicalDevice() {
   createInfo.pNext = &dynamicRendering;
   logicalDevice_ = physicalDevice_.createDevice(createInfo);
 
-  graphicsQueue_ = logicalDevice_.getQueue(graphicsQueueFamily_, 0);
-  computeQueue_ = logicalDevice_.getQueue(computeQueueFamily_, 0);
-  transferQueue_ = logicalDevice_.getQueue(transferQueueFamily_, 0);
+  // Assign each usage a distinct queue index within its family.
+  // When families differ, each gets index 0.  When they overlap
+  // (e.g. all three on family 0), they get indices 0, 1, 2.
+  std::map<std::uint32_t, std::uint32_t> nextIdx;
+  graphicsQueue_ = logicalDevice_.getQueue(
+      graphicsQueueFamily_, nextIdx[graphicsQueueFamily_]++);
+  computeQueue_ = logicalDevice_.getQueue(
+      computeQueueFamily_, nextIdx[computeQueueFamily_]++);
+  transferQueue_ = logicalDevice_.getQueue(
+      transferQueueFamily_, nextIdx[transferQueueFamily_]++);
 }
 
 // --- Swapchain -------------------------------------------------------------
@@ -777,10 +801,7 @@ void RenderDevice::computeLoop() {
       cb.end();
 
       vk::SubmitInfo submit({}, {}, *cb);
-      {
-        std::lock_guard<std::mutex> lk(queueMtx_);
-        transferQueue_.submit(submit, *copyFences_[nextBuf]);
-      }
+      transferQueue_.submit(submit, *copyFences_[nextBuf]);
     }
 
     // ---- Update uniform & dispatch compute on nextBuf ----
@@ -804,10 +825,7 @@ void RenderDevice::computeLoop() {
       cb.end();
 
       vk::SubmitInfo submit({}, {}, *cb);
-      {
-        std::lock_guard<std::mutex> lk(queueMtx_);
-        computeQueue_.submit(submit, *computeFences_[nextBuf]);
-      }
+      computeQueue_.submit(submit, *computeFences_[nextBuf]);
     }
 
     // Wait for compute to finish
@@ -906,6 +924,11 @@ void RenderDevice::recordComputeCommands(vk::CommandBuffer cb, int bufIdx) {
 // Render thread (drawFrame)
 // ===================================================================
 void RenderDevice::drawFrame() {
+  // Bail early if window is closing — avoids blocking in presentKHR /
+  // acquireNextImage when the surface is already invalid.
+  if (window_.shouldClose())
+    return;
+
   // ---- Grab the latest ready buffer (non-blocking) ----
   int renderBuf;
   bool gotNewData = false;
@@ -926,21 +949,42 @@ void RenderDevice::drawFrame() {
 
   std::uint32_t frameIdx = currentFrame_ % swapchainImages_.size();
 
-  // Wait for fence of the current frame slot
+  // Wait for the fence of this frame slot (make sure the previous frame
+  // that used this slot is done before we acquire a new image).
+  // IMPORTANT: only WAIT, don't RESET yet — we defer the reset until
+  // acquireNextImage succeeds, so that early returns don't leave the
+  // fence in an unsignaled state (which would hang next wrap-around).
   (void)logicalDevice_.waitForFences(*inFlightFences_[frameIdx], VK_TRUE,
                                      UINT64_MAX);
-  logicalDevice_.resetFences(*inFlightFences_[frameIdx]);
 
-  // Acquire swapchain image
+  // Acquire swapchain image with a finite timeout — infinite timeout
+  // can hang forever on surface loss / window close.
+  constexpr std::uint64_t kAcquireTimeoutNs = 1'000'000'000; // 1 second
   auto [result, imageIndex] = swapchain_.acquireNextImage(
-      UINT64_MAX, *imageAvailableSemaphores_[frameIdx]);
-  if (result == vk::Result::eErrorOutOfDateKHR) {
+      kAcquireTimeoutNs, *imageAvailableSemaphores_[frameIdx]);
+
+  if (result == vk::Result::eErrorOutOfDateKHR ||
+      result == vk::Result::eErrorSurfaceLostKHR ||
+      result == vk::Result::eTimeout) {
+    // Surface lost or timed out.  The fence is still SIGNALED (we didn't
+    // reset it above) so the next cycle on this slot won't deadlock.
+    // Release the buffer we grabbed so the compute thread can keep going.
+    if (gotNewData) {
+      std::lock_guard<std::mutex> lk(sharedMtx_);
+      if (readyBuf_ == -1)
+        readyBuf_ = renderBuf;
+      renderingBuf_ = -1;
+    }
+    sharedCv_.notify_one();
     ++currentFrame_;
     return;
   }
   if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
     throw std::runtime_error("Failed to acquire swapchain image");
   }
+
+  // We have a valid image — commit to this frame.
+  logicalDevice_.resetFences(*inFlightFences_[frameIdx]);
   currentImageIndex_ = imageIndex;
 
   // Record render commands using the chosen particle buffer
@@ -949,15 +993,12 @@ void RenderDevice::drawFrame() {
   recordGraphicsCommands(*cb, renderBuf);
   cb.end();
 
-  // Submit
+  // Submit — graphicsQueue_ is only used from this thread, no mutex needed.
   vk::PipelineStageFlags waitStage =
       vk::PipelineStageFlagBits::eColorAttachmentOutput;
   vk::SubmitInfo submit(*imageAvailableSemaphores_[frameIdx], waitStage, *cb,
                         *renderFinishedSemaphores_[imageIndex]);
-  {
-    std::lock_guard<std::mutex> lk(queueMtx_);
-    graphicsQueue_.submit(submit, *inFlightFences_[frameIdx]);
-  }
+  graphicsQueue_.submit(submit, *inFlightFences_[frameIdx]);
 
   // Signal per-buffer fence for cross-queue synchronisation.
   // This tells the compute thread that the GPU is truly done reading
@@ -970,21 +1011,17 @@ void RenderDevice::drawFrame() {
     // or from a previous cycle; reset it before submission.
     logicalDevice_.resetFences(*renderDoneFences_[renderBuf]);
     vk::SubmitInfo fenceSubmit({}, {}, {}, {});
-    {
-      std::lock_guard<std::mutex> lk(queueMtx_);
-      graphicsQueue_.submit(fenceSubmit, *renderDoneFences_[renderBuf]);
-    }
+    graphicsQueue_.submit(fenceSubmit, *renderDoneFences_[renderBuf]);
   }
 
   // Present
-  vk::PresentInfoKHR present(*renderFinishedSemaphores_[imageIndex],
-                             *swapchain_, imageIndex);
-  {
-    std::lock_guard<std::mutex> lk(queueMtx_);
-    result = graphicsQueue_.presentKHR(present);
-  }
-  if (result == vk::Result::eErrorOutOfDateKHR) {
-    // TODO: recreate swapchain
+  result = graphicsQueue_.presentKHR(
+      vk::PresentInfoKHR(*renderFinishedSemaphores_[imageIndex],
+                         *swapchain_, imageIndex));
+
+  if (result == vk::Result::eErrorOutOfDateKHR ||
+      result == vk::Result::eErrorSurfaceLostKHR) {
+    // Swapchain needs recreation — handled in future work.
   }
 
   // Mark rendering done — only release buffer if new data was consumed,
