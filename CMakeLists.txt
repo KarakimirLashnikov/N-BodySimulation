@@ -45,6 +45,7 @@ add_executable(N-BodySimulation
     render_device.cpp
     window.cpp
 )
+add_subdirectory(cuda)
 
 target_compile_features(N-BodySimulation PRIVATE cxx_std_17)
 

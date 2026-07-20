@@ -10,7 +10,7 @@
             },
             "environment": {
                 "CFLAGS": "/fsanitize=address",
-                "CXXFLAGS": "/fsanitize=address /fsanitize=thread"
+                "CXXFLAGS": "/fsanitize=address"
             }
         },
         {
